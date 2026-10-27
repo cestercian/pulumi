@@ -231,7 +231,7 @@ func (g *generator) GenBinaryOpExpression(w io.Writer, expr *model.BinaryOpExpre
 }
 
 func (g *generator) GenConditionalExpression(w io.Writer, expr *model.ConditionalExpression) {
-	g.Fgenf(w, "%.2v if %.2v else %.2v", expr.TrueResult, expr.Condition, expr.FalseResult)
+	g.Fgenf(w, "%.2o if %.2o else %.2v", expr.TrueResult, expr.Condition, expr.FalseResult)
 }
 
 func (g *generator) GenForExpression(w io.Writer, expr *model.ForExpression) {
@@ -476,6 +476,12 @@ func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionC
 			case model.IntType.AssignableFrom(to) && !model.IntType.AssignableFrom(fromType):
 				genMaybeOutputConversion(func(v string) {
 					g.Fgenf(w, "int(%s)", v)
+				})
+			// list[T | None] is not a Sequence[T]. Drop Nones so the list matches a
+			// required primitive array input. Go projects the same splat to []T.
+			case plainOptionalPrimitiveList(fromType, to):
+				genMaybeOutputConversion(func(v string) {
+					g.Fgenf(w, "[item for item in %s if item is not None]", v)
 				})
 			default:
 				switch arg := from.(type) {
@@ -1129,6 +1135,23 @@ func (g *generator) GenTupleConsExpression(w io.Writer, expr *model.TupleConsExp
 		})
 		g.Fgen(w, "\n", g.Indent, "]")
 	}
+}
+
+// plainOptionalPrimitiveList reports whether from is a list of optional
+// primitives and to is a list of that same primitive.
+func plainOptionalPrimitiveList(from, to model.Type) bool {
+	fromList, ok := from.(*model.ListType)
+	if !ok || !model.IsOptionalType(fromList.ElementType) {
+		return false
+	}
+	elem := pcl.UnwrapOption(model.ResolveOutputs(fromList.ElementType))
+	switch elem {
+	case model.StringType, model.NumberType, model.IntType, model.BoolType:
+	default:
+		return false
+	}
+	toList, ok := to.(*model.ListType)
+	return ok && toList.ElementType.Equals(elem)
 }
 
 func (g *generator) GenUnaryOpExpression(w io.Writer, expr *model.UnaryOpExpression) {

@@ -567,10 +567,11 @@ func (ectx *EvalContext) builtinFunctions() map[string]function.Function {
 			if id.IsKnown() {
 				idPV = property.New(id.AsString())
 			}
-			argsPM = argsPM.Set("__self__", property.New(property.ResourceReference{
-				URN: resource.URN(urnVal.AsString()),
-				ID:  idPV,
-			}))
+			argsPM = argsPM.Set("__self__", property.New(property.NewResourceReference(
+				resource.URN(urnVal.AsString()),
+				idPV,
+				"",
+			)))
 
 			request := &pulumirpc.ResourceCallRequest{
 				Tok:                fun.Token,
@@ -666,6 +667,59 @@ func (ectx *EvalContext) builtinFunctions() map[string]function.Function {
 				resultPV = resultPV.WithDependencies(append(resultPV.Dependencies(), dependsOn...))
 			}
 			return propertyValueToCty(context.TODO(), ectx.getResource, resultPV)
+		},
+	})
+
+	// resourceExists reports whether a resource of the given type with the given ID exists, passing any state to the
+	// provider's Read. A resource being checked for existence has no logical identity, so no name is required. If the
+	// ID is unknown (e.g. during preview), or the engine can't determine existence, the result is unknown.
+	existsResourceFn := function.New(&function.Spec{
+		Params: []function.Parameter{
+			{
+				Name: "type",
+				Type: cty.String,
+			},
+			{
+				Name:        "id",
+				Type:        cty.String,
+				AllowMarked: true,
+			},
+		},
+		VarParam: &function.Parameter{
+			Name:        "state",
+			Type:        cty.DynamicPseudoType,
+			AllowMarked: true,
+			AllowNull:   true,
+		},
+		Type: function.StaticReturnType(cty.Bool),
+		Impl: func(args []cty.Value, retType cty.Type) (cty.Value, error) {
+			// The ID is typically an output of the resource being checked, so it carries secret and dependency
+			// marks. Strip them before reading the underlying string.
+			id, _ := args[1].Unmark()
+			// During preview the ID of a resource that has not yet been created is unknown; the runtime represents
+			// this as an empty string. We can't check existence without an ID, so the result is unknown.
+			if !id.IsKnown() || id.AsString() == "" {
+				return cty.UnknownVal(cty.Bool), nil
+			}
+			req := &pulumirpc.ExistsResourceRequest{
+				Type: args[0].AsString(),
+				Id:   id.AsString(),
+			}
+			if len(args) == 3 && !args[2].IsNull() {
+				state, err := ctyToPropertyValue(args[2])
+				if err != nil {
+					return cty.NilVal, fmt.Errorf("resourceExists: invalid state: %w", err)
+				}
+				req.Properties = propertyrpc.Marshal(stripOutputs(state).AsMap())
+			}
+			resp, err := ectx.existsResource(context.TODO(), req)
+			if err != nil {
+				return cty.NilVal, fmt.Errorf("resourceExists: %w", err)
+			}
+			if resp.GetUnknown() {
+				return cty.UnknownVal(cty.Bool), nil
+			}
+			return cty.BoolVal(resp.GetExists()), nil
 		},
 	})
 
@@ -901,6 +955,52 @@ func (ectx *EvalContext) builtinFunctions() map[string]function.Function {
 				return args[0].Index(cty.NumberIntVal(0)), nil
 			}
 			return cty.NilVal, fmt.Errorf("expected list to have at most one element, got %d", args[0].LengthInt())
+		},
+	})
+
+	// lookupFn returns the default unchanged when the key is absent. cty's lookup converts the default to the
+	// element type of a map, but the binder types the result as the unification of the element type and the
+	// default, so the default need not convert.
+	lookupFn := function.New(&function.Spec{
+		Params: []function.Parameter{
+			{
+				Name:        "collection",
+				Type:        cty.DynamicPseudoType,
+				AllowMarked: true,
+			},
+			{
+				Name:        "key",
+				Type:        cty.String,
+				AllowMarked: true,
+			},
+			{
+				Name:        "default",
+				Type:        cty.DynamicPseudoType,
+				AllowMarked: true,
+			},
+		},
+		Type: func(args []cty.Value) (cty.Type, error) {
+			collection := args[0].Type()
+			if !collection.IsObjectType() && !collection.IsMapType() {
+				return cty.NilType, function.NewArgErrorf(0, "the first argument to 'lookup' must be a map")
+			}
+			return cty.DynamicPseudoType, nil
+		},
+		Impl: func(args []cty.Value, retType cty.Type) (cty.Value, error) {
+			collection, marks := args[0].Unmark()
+			key, keyMarks := args[1].Unmark()
+			if !collection.IsWhollyKnown() || !key.IsKnown() {
+				return cty.DynamicVal.WithMarks(marks, keyMarks), nil
+			}
+			name := key.AsString()
+			if collection.Type().IsObjectType() {
+				if collection.Type().HasAttribute(name) {
+					return collection.GetAttr(name).WithMarks(marks, keyMarks), nil
+				}
+			} else if collection.HasIndex(key) == cty.True {
+				return collection.Index(key).WithMarks(marks, keyMarks), nil
+			}
+			return args[2].WithMarks(marks, keyMarks), nil
 		},
 	})
 
@@ -1172,6 +1272,7 @@ func (ectx *EvalContext) builtinFunctions() map[string]function.Function {
 		"getOutput":          getOutputFn,
 		"invoke":             invokeFn,
 		"call":               callFn,
+		"resourceExists":     existsResourceFn,
 		"fileAsset":          fileAssetFn,
 		"fileArchive":        fileArchiveFn,
 		"assetArchive":       assetArchiveFn,
@@ -1189,7 +1290,7 @@ func (ectx *EvalContext) builtinFunctions() map[string]function.Function {
 		"range":              stdlib.RangeFunc,
 		"singleOrNone":       singleOrNoneFn,
 		"entries":            entriesFn,
-		"lookup":             stdlib.LookupFunc,
+		"lookup":             lookupFn,
 		"toBase64":           toBase64Fn,
 		"fromBase64":         fromBase64Fn,
 		"toJSON":             toJSONFn,

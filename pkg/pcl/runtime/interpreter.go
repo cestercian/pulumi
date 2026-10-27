@@ -415,6 +415,13 @@ func (i *Interpreter) call(
 	return resp, err
 }
 
+func (i *Interpreter) existsResource(
+	ctx context.Context, req *pulumirpc.ExistsResourceRequest,
+) (*pulumirpc.ExistsResourceResponse, error) {
+	req.PackageRef = i.getPackageRefFromToken(req.Type)
+	return i.monitor.ExistsResource(ctx, req)
+}
+
 func (i *Interpreter) getResource(ctx context.Context, ref property.ResourceReference) (property.Map, error) {
 	args, err := structpb.NewStruct(map[string]any{
 		"urn": string(ref.URN),
@@ -497,6 +504,7 @@ func (i *Interpreter) Run(ctx context.Context) error {
 		i.getResource,
 		i.invoke,
 		i.call,
+		i.existsResource,
 	)
 
 	// Probe the monitor for the INVOKE_OUTPUT_VALUES and CALL_OUTPUT_VALUES capabilities. Older monitors don't
@@ -579,6 +587,7 @@ func (i *Interpreter) RunEmbedded(
 		i.getResource,
 		i.invoke,
 		i.call,
+		i.existsResource,
 	)
 	for name, val := range scopeVars {
 		ctyVal, err := propertyValueToCty(ctx, i.getResource, val)
@@ -1110,10 +1119,11 @@ func collapseResourceReferences(value property.Value) property.Value {
 		id, hasID := collapsed["id"]
 		typ, hasType := collapsed["__type"]
 		if hasURN && hasID && hasType && urn.IsString() && typ.IsString() {
-			ref := property.ResourceReference{
-				URN: resource.URN(urn.AsString()),
-				ID:  id,
-			}
+			ref := property.NewResourceReference(
+				resource.URN(urn.AsString()),
+				id,
+				"",
+			)
 			// A dependency on only the referenced resource adds nothing to the reference itself.
 			if d := value.Dependencies(); len(d) == 1 && d[0] == ref.URN {
 				value = value.WithDependencies(nil)
@@ -1317,6 +1327,7 @@ func (i *Interpreter) registerResourceWith(
 		AcceptResources:         true,
 		AcceptsByteString:       true,
 		SupportsResultReporting: true,
+		SupportsPartialValues:   true,
 		SnippetId:               i.snippetID,
 	}
 	request.PackageRef = i.getPackageRefFromToken(token)
@@ -1870,19 +1881,22 @@ func (i *Interpreter) registerResourceWith(
 	if err != nil {
 		return cty.NilVal, err
 	}
-	if resp.GetResult() != pulumirpc.Result_SUCCESS {
-		// This resource failed to register but we might be running with --continue-on-error so mark this resource as
-		// poisoned so that any downstream resources that depend on it will also be marked as poisoned and skip
-		// registering while allowing the rest of the graph to continue registering.
-		return makePoisonValue(res.Name()), nil
+	// A failed registration (e.g. under --continue-on-error) is surfaced to the program as if every
+	// output of the resource were unknown, so references propagate as unknowns rather than halting the
+	// rest of the program at the first failed resource. Discard any echoed-back inputs from the
+	// response so references like `failing.value` resolve to Computed rather than the known input.
+	failed := resp.GetResult() != pulumirpc.Result_SUCCESS
+	var outputs property.Map
+	if failed {
+		outputs = property.NewMap(nil)
+	} else {
+		outputs, err = propertyrpc.Unmarshal(resp.Object)
+		if err != nil {
+			return cty.NilVal, err
+		}
 	}
 
-	outputs, err := propertyrpc.Unmarshal(resp.Object)
-	if err != nil {
-		return cty.NilVal, err
-	}
-
-	unknown := custom && !i.info.DryRun && resp.GetUnknown()
+	unknown := failed || (custom && !i.info.DryRun && resp.GetUnknown())
 
 	// During previews a created resource has no ID yet, and a skipped create never gets
 	// one; represent it as unknown rather than a known empty string so it can't be
@@ -1896,6 +1910,17 @@ func (i *Interpreter) registerResourceWith(
 		Set("urn", property.New(resp.GetUrn())).
 		Set("__name", property.New(request.Name)).
 		Set("__type", property.New(request.Type))
+
+	// An output can depend on other resources, such as a remote component's outputs on its children.
+	for key, deps := range resp.GetPropertyDependencies() {
+		if v, ok := outputs.GetOk(key); ok {
+			urns := v.Dependencies()
+			for _, u := range deps.GetUrns() {
+				urns = append(urns, resource.URN(u))
+			}
+			outputs = outputs.Set(key, v.WithDependencies(urns))
+		}
+	}
 
 	// Ensure every schema-declared output property is present, recursing into nested object
 	// types so that programs which traverse into an optional inner field see a typed null
@@ -2002,13 +2027,33 @@ func (i *Interpreter) registerReadResource(ctx context.Context, res *pcl.ReadRes
 		return err
 	}
 
-	outputs, err := propertyrpc.Unmarshal(resp.GetProperties())
-	if err != nil {
-		return err
+	// A failed read reports a non-success result; discard whatever came back so its outputs are
+	// unknown, just like a skipped read.
+	failed := resp.GetResult() != pulumirpc.Result_SUCCESS
+	var outputs property.Map
+	if failed {
+		outputs = property.NewMap(nil)
+	} else {
+		outputs, err = propertyrpc.Unmarshal(resp.GetProperties())
+		if err != nil {
+			return err
+		}
 	}
 
+	// Prefer the id returned by the provider's Read, which may differ from the id supplied on
+	// the request. An empty response id during preview means "unknown"; during update it
+	// indicates an older engine that did not populate the field, so fall back to the request id.
+	var idValue property.Value
+	switch {
+	case resp.GetId() != "":
+		idValue = property.New(resp.GetId())
+	case i.info.DryRun:
+		idValue = property.New(property.Computed)
+	default:
+		idValue = property.New(request.Id)
+	}
 	outputs = outputs.
-		Set("id", property.New(request.Id)).
+		Set("id", idValue).
 		Set("urn", property.New(resp.GetUrn())).
 		Set("__name", property.New(logicalName)).
 		Set("__type", property.New(token))
@@ -2016,7 +2061,7 @@ func (i *Interpreter) registerReadResource(ctx context.Context, res *pcl.ReadRes
 	if schemaResource != nil {
 		// A skipped read reports Unknown=true; treat outputs as unknown so dependents propagate
 		// unknowns instead of seeing empty values as real.
-		outputs = fillSchemaOutputs(outputs, schemaResource.Properties, i.info.DryRun || resp.GetUnknown())
+		outputs = fillSchemaOutputs(outputs, schemaResource.Properties, i.info.DryRun || failed || resp.GetUnknown())
 	}
 
 	result := property.New(outputs).WithDependencies([]urn.URN{resource.URN(resp.GetUrn())})
@@ -2164,6 +2209,7 @@ func (i *Interpreter) registerComponent(ctx context.Context, component *pcl.Comp
 		i.getResource,
 		componentInterpreter.invoke,
 		componentInterpreter.call,
+		componentInterpreter.existsResource,
 	)
 
 	for k, v := range inputs.All {

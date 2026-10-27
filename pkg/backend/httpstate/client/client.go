@@ -39,6 +39,7 @@ import (
 
 	"github.com/blang/semver"
 	"github.com/opentracing/opentracing-go"
+	cloudapitype "github.com/pulumi/pulumi-cloud-sdk/go/apitype"
 	"go.opentelemetry.io/otel"
 
 	"github.com/pulumi/pulumi/pkg/v3/engine"
@@ -1792,9 +1793,12 @@ type ListAuditLogsOptions struct {
 	// User filters the audit log to events triggered by a single user, by
 	// GitHub login. Empty means no filter.
 	User string
-	// StartTime is the upper-bound timestamp of the time range to query, as
-	// understood by the V1 endpoint. Empty means the service default.
+	// StartTime is the lower-bound Unix timestamp of the time range to query.
+	// Empty means the service default.
 	StartTime string
+	// EndTime is the upper-bound Unix timestamp of the time range to query.
+	// Empty means the service default.
+	EndTime string
 	// ContinuationToken pages through results; pass the ContinuationToken
 	// returned by a previous response to fetch the next page.
 	ContinuationToken string
@@ -1802,24 +1806,26 @@ type ListAuditLogsOptions struct {
 
 // ListAuditLogs returns a single page of audit log events for the given
 // organization, wrapping the `ListAuditLogEvents` Pulumi Cloud REST endpoint
-// (GET /api/orgs/{orgName}/auditlogs).
+// (GET /api/orgs/{orgName}/auditlogs/v2).
 func (pc *Client) ListAuditLogs(
 	ctx context.Context, orgName string, opts ListAuditLogsOptions,
 ) (apitype.ListAuditLogEventsResponse, error) {
 	queryObj := struct {
-		EventType         string `url:"eventType,omitempty"`
-		User              string `url:"user,omitempty"`
+		EventType         string `url:"eventFilter,omitempty"`
+		User              string `url:"userFilter,omitempty"`
 		StartTime         string `url:"startTime,omitempty"`
+		EndTime           string `url:"endTime,omitempty"`
 		ContinuationToken string `url:"continuationToken,omitempty"`
 	}{
 		EventType:         opts.EventType,
 		User:              opts.User,
 		StartTime:         opts.StartTime,
+		EndTime:           opts.EndTime,
 		ContinuationToken: opts.ContinuationToken,
 	}
 
 	var resp apitype.ListAuditLogEventsResponse
-	path := fmt.Sprintf("/api/orgs/%s/auditlogs", url.PathEscape(orgName))
+	path := fmt.Sprintf("/api/orgs/%s/auditlogs/v2", url.PathEscape(orgName))
 	if err := pc.restCall(ctx, http.MethodGet, path, queryObj, nil, &resp); err != nil {
 		return resp, fmt.Errorf("listing audit logs: %w", err)
 	}
@@ -1838,9 +1844,12 @@ type ExportAuditLogsOptions struct {
 	// User filters the audit log to events triggered by a single user, by
 	// GitHub login. Empty means no filter.
 	User string
-	// StartTime is the upper-bound timestamp of the time range to query, as
-	// understood by the V1 endpoint. Empty means the service default.
+	// StartTime is the lower-bound Unix timestamp of the time range to query.
+	// Empty means the service default.
 	StartTime string
+	// EndTime is the upper-bound Unix timestamp of the time range to query.
+	// Empty means the service default.
+	EndTime string
 	// ContinuationToken pages through results; pass the ContinuationToken
 	// returned by a previous response to fetch the next page.
 	ContinuationToken string
@@ -1849,7 +1858,7 @@ type ExportAuditLogsOptions struct {
 // ExportAuditLogs streams an export of audit log events for the given
 // organization in the requested format (csv or cef), wrapping the
 // `ExportAuditLogEvents` Pulumi Cloud REST endpoint
-// (GET /api/orgs/{orgName}/auditlogs/export). Unlike ListAuditLogs, the
+// (GET /api/orgs/{orgName}/auditlogs/v2/export). Unlike ListAuditLogs, the
 // response is plain text (CSV or CEF lines), not JSON; the caller is
 // responsible for closing the returned ReadCloser.
 func (pc *Client) ExportAuditLogs(
@@ -1861,20 +1870,22 @@ func (pc *Client) ExportAuditLogs(
 	}
 	queryObj := struct {
 		Format            string `url:"format,omitempty"`
-		EventType         string `url:"eventType,omitempty"`
-		User              string `url:"user,omitempty"`
+		EventType         string `url:"eventFilter,omitempty"`
+		User              string `url:"userFilter,omitempty"`
 		StartTime         string `url:"startTime,omitempty"`
+		EndTime           string `url:"endTime,omitempty"`
 		ContinuationToken string `url:"continuationToken,omitempty"`
 	}{
 		Format:            format,
 		EventType:         opts.EventType,
 		User:              opts.User,
 		StartTime:         opts.StartTime,
+		EndTime:           opts.EndTime,
 		ContinuationToken: opts.ContinuationToken,
 	}
 
 	var body io.ReadCloser
-	path := fmt.Sprintf("/api/orgs/%s/auditlogs/export", url.PathEscape(orgName))
+	path := fmt.Sprintf("/api/orgs/%s/auditlogs/v2/export", url.PathEscape(orgName))
 	if err := pc.restCall(ctx, http.MethodGet, path, queryObj, nil, &body); err != nil {
 		return nil, fmt.Errorf("exporting audit logs: %w", err)
 	}
@@ -1908,34 +1919,25 @@ func (pc *Client) RemoveOrganizationMember(ctx context.Context, orgName, userLog
 	return nil
 }
 
-// ListPolicyIssuesOptions are the optional pagination parameters accepted by
-// ListPolicyIssues. Zero values mean "let the server pick the default":
-// Page < 1 → 1, PageSize ≤ 0 → server default, Asc false → descending order.
-// ListPolicyIssuesOptions configures the policy issues list request.
-type ListPolicyIssuesOptions struct {
-	// StartRow is the 0-based offset of the first result.
-	StartRow int
-	// EndRow is the exclusive upper bound (startRow + pageSize).
-	EndRow int
-}
-
 // ListPolicyIssues returns a paginated list of policy issues for the given
 // organization, wrapping the `ListPolicyIssues` Pulumi Cloud REST endpoint
 // (POST /api/orgs/{orgName}/policyresults/issues). The endpoint uses POST
 // because the request body carries pagination parameters in an AngularGrid
 // format.
 func (pc *Client) ListPolicyIssues(
-	ctx context.Context, orgName string, opts ListPolicyIssuesOptions,
-) (apitype.ListPolicyIssuesResponse, error) {
-	req := apitype.ListPolicyIssuesRequest{
-		StartRow: opts.StartRow,
-		EndRow:   opts.EndRow,
-	}
+	ctx context.Context, orgName string, req cloudapitype.AngularGridGetRowsRequest,
+) (cloudapitype.ListPolicyIssuesResponse, error) {
+	// Send startRow and endRow even when zero; the generated type omits them.
+	body := struct {
+		cloudapitype.AngularGridGetRowsRequest
+		StartRow int `json:"startRow"`
+		EndRow   int `json:"endRow"`
+	}{req, req.StartRow, req.EndRow}
 	path := fmt.Sprintf("/api/orgs/%s/policyresults/issues", url.PathEscape(orgName))
 
-	var resp apitype.ListPolicyIssuesResponse
-	if err := pc.restCall(ctx, http.MethodPost, path, nil, req, &resp); err != nil {
-		return apitype.ListPolicyIssuesResponse{}, fmt.Errorf("listing policy issues: %w", err)
+	var resp cloudapitype.ListPolicyIssuesResponse
+	if err := pc.restCall(ctx, http.MethodPost, path, nil, body, &resp); err != nil {
+		return cloudapitype.ListPolicyIssuesResponse{}, fmt.Errorf("listing policy issues: %w", err)
 	}
 	return resp, nil
 }
@@ -1943,12 +1945,12 @@ func (pc *Client) ListPolicyIssues(
 // GetPolicyComplianceResults returns compliance results for policy issues
 // grouped by entity.
 func (pc *Client) GetPolicyComplianceResults(
-	ctx context.Context, orgName string, req apitype.GetPolicyComplianceResultsRequest,
-) (apitype.GetPolicyComplianceResultsResponse, error) {
+	ctx context.Context, orgName string, req cloudapitype.GetPolicyComplianceResultsRequest,
+) (cloudapitype.GetPolicyComplianceResultsResponse, error) {
 	path := fmt.Sprintf("/api/orgs/%s/policyresults/compliance", url.PathEscape(orgName))
-	var resp apitype.GetPolicyComplianceResultsResponse
+	var resp cloudapitype.GetPolicyComplianceResultsResponse
 	if err := pc.restCall(ctx, http.MethodPost, path, nil, req, &resp); err != nil {
-		return apitype.GetPolicyComplianceResultsResponse{},
+		return cloudapitype.GetPolicyComplianceResultsResponse{},
 			fmt.Errorf("getting policy compliance results: %w", err)
 	}
 	return resp, nil
@@ -1959,14 +1961,14 @@ func (pc *Client) GetPolicyComplianceResults(
 // (GET /api/orgs/{orgName}/policyresults/issues/{issueId}).
 func (pc *Client) GetPolicyIssue(
 	ctx context.Context, orgName, issueID string,
-) (apitype.PolicyIssue, error) {
+) (cloudapitype.PolicyIssue, error) {
 	path := fmt.Sprintf(
 		"/api/orgs/%s/policyresults/issues/%s",
 		url.PathEscape(orgName), url.PathEscape(issueID))
 
-	var resp apitype.GetPolicyIssueResponse
+	var resp cloudapitype.GetPolicyIssueResponse
 	if err := pc.restCall(ctx, http.MethodGet, path, nil, nil, &resp); err != nil {
-		return apitype.PolicyIssue{}, fmt.Errorf("getting policy issue: %w", err)
+		return cloudapitype.PolicyIssue{}, fmt.Errorf("getting policy issue: %w", err)
 	}
 	return resp.PolicyIssue, nil
 }

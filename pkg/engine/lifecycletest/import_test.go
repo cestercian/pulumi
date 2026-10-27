@@ -35,6 +35,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/deploytest"
 	"github.com/pulumi/pulumi/pkg/v3/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
@@ -52,8 +53,8 @@ func TestImportOption(t *testing.T) {
 		"out": property.New(41.0),
 	})
 
-	// For imports we expect inputs and state to be nil, but when we change to do a read they should both be set to the
-	// resource inputs.
+	// For imports we expect inputs and state to be empty. For a read we expect the resource inputs to be passed in the
+	// Inputs field; State is empty (the engine no longer duplicates Inputs into State on reads for non-dynamic providers).
 	var expectedInputs, expectedState property.Map
 	loaders := []*deploytest.ProviderLoader{
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
@@ -328,7 +329,7 @@ func TestImportOption(t *testing.T) {
 
 	// Change the program to read a resource rather than creating one.
 	readID = "id"
-	expectedInputs, expectedState = resource.FromResourcePropertyMap(inputs), resource.FromResourcePropertyMap(inputs)
+	expectedInputs, expectedState = resource.FromResourcePropertyMap(inputs), property.Map{}
 	snap, err = lt.TestOp(Update).RunStep(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient,
 		func(_ workspace.Project, _ deploy.Target, entries JournalEntries, _ []Event, err error) error {
 			for _, entry := range entries {
@@ -1253,6 +1254,81 @@ func TestImportPlanEmptyState(t *testing.T) {
 	require.Len(t, snap.Resources, 3)
 }
 
+func TestImportCheckFailureRedactsSecrets(t *testing.T) {
+	t.Parallel()
+
+	loaders := []*deploytest.ProviderLoader{
+		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
+			return &deploytest.Provider{
+				CheckF: func(context.Context, plugin.CheckRequest) (plugin.CheckResponse, error) {
+					return plugin.CheckResponse{
+						Failures: []plugin.CheckFailure{{Property: "foo", Reason: "bad foo"}},
+					}, nil
+				},
+				ReadF: func(context.Context, plugin.ReadRequest) (plugin.ReadResponse, error) {
+					inputs := property.NewMap(map[string]property.Value{
+						"foo": property.New("secret-input-value").WithSecret(true),
+					})
+					return plugin.ReadResponse{
+						ReadResult: plugin.ReadResult{Inputs: &inputs, Outputs: &inputs},
+						Status:     resource.StatusOK,
+					}, nil
+				},
+			}, nil
+		}),
+	}
+	hostF := deploytest.NewPluginHostF(nil, nil, deploytest.NewLanguageRuntimeF(nil), nil, nil, loaders...)
+
+	cases := []struct {
+		name        string
+		showSecrets bool
+		expected    string
+	}{
+		{
+			name:     "redacted",
+			expected: "pkgA:m:typA resource 'resB': property foo value {[secret]} has a problem: bad foo\n",
+		},
+		{
+			name:        "with ShowSecrets",
+			showSecrets: true,
+			expected:    "pkgA:m:typA resource 'resB': property foo value {&{{secret-input-value}}} has a problem: bad foo\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := &lt.TestPlan{
+				Options: lt.TestUpdateOptions{
+					T:                t,
+					HostF:            hostF,
+					UpdateOptions:    UpdateOptions{ShowSecrets: c.showSecrets},
+					SkipDisplayTests: true,
+				},
+			}
+			validate := func(project workspace.Project, target deploy.Target, entries JournalEntries,
+				evts []Event, err error,
+			) error {
+				var msgs []string
+				for _, evt := range evts {
+					if evt.Type == DiagEvent {
+						msgs = append(msgs, colors.Never.Colorize(evt.Payload().(DiagEventPayload).Message))
+					}
+				}
+				assert.Contains(t, msgs, c.expected)
+				return err
+			}
+
+			_, err := lt.ImportOp([]deploy.Import{{
+				Type: "pkgA:m:typA",
+				Name: "resB",
+				ID:   "imported-id",
+			}}).Run(p.GetProject(), p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestImportPlanSpecificProvider(t *testing.T) {
 	t.Parallel()
 
@@ -1826,8 +1902,8 @@ func TestImportWithFailedUpdate(t *testing.T) {
 		"out": property.New(41.0),
 	})
 
-	// For imports we expect inputs and state to be nil, but when we change to do a read they should both be set to the
-	// resource inputs.
+	// For imports we expect inputs and state to be empty. For a read we expect the resource inputs to be passed in the
+	// Inputs field; State is empty (the engine no longer duplicates Inputs into State on reads for non-dynamic providers).
 	var expectedInputs, expectedState property.Map
 	loaders := []*deploytest.ProviderLoader{
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {

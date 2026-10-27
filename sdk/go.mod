@@ -27,7 +27,7 @@ require (
 	go.opentelemetry.io/otel/bridge/opentracing v1.45.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/mod v0.40.0 // indirect
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sys v0.48.0
 	google.golang.org/grpc v1.83.2
 	gopkg.in/yaml.v2 v2.4.0
@@ -57,7 +57,7 @@ require (
 	github.com/pgavlin/fx/v2 v2.0.12
 	github.com/pkg/term v1.1.0
 	github.com/pulumi/appdash v0.0.0-20231130102222-75f619a67231
-	github.com/pulumi/pulumi-cloud-sdk/go v1.20260918.0
+	github.com/pulumi/pulumi-cloud-sdk/go v1.20261019.1659
 	github.com/santhosh-tekuri/jsonschema/v5 v5.0.0
 	github.com/zalando/go-keyring v0.2.8
 	go.opentelemetry.io/collector/pdata v1.53.0

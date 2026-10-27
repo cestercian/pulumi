@@ -75,6 +75,21 @@ func TestCommandNameContext(t *testing.T) {
 	assert.Equal(t, "pulumi new", name)
 }
 
+func TestWelcomeUserNewProjectHint(t *testing.T) {
+	t.Parallel()
+
+	for _, newProjectHint := range []bool{true, false} {
+		t.Run(fmt.Sprintf("newProjectHint=%v", newProjectHint), func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+			welcomeUser(&buf, display.Options{Color: colors.Never}, "https://app.pulumi.com", newProjectHint)
+			assert.Contains(t, buf.String(), "Welcome to Pulumi!")
+			assert.Equal(t, newProjectHint, strings.Contains(buf.String(), "New to Pulumi?"))
+		})
+	}
+}
+
 //nolint:paralleltest // mutates global configuration
 func TestEnabledFullyQualifiedStackNames(t *testing.T) {
 	// Arrange
@@ -151,6 +166,17 @@ func TestDisabledFullyQualifiedStackNames(t *testing.T) {
 
 	// Assert
 	assert.Equal(t, expected, actual)
+}
+
+func TestURLIsConsoleRoot(t *testing.T) {
+	t.Parallel()
+
+	// A new user's orgs aren't named after their login, so a URL ending in the login would 404.
+	user := &promise.CompletionSource[userInfo]{}
+	user.MustFulfill(userInfo{username: "jane", organizations: []string{"jane-org"}})
+	b := &cloudBackend{url: "https://api.pulumi.com", userInfo: user.Promise()}
+
+	assert.Equal(t, "https://app.pulumi.com", b.URL())
 }
 
 func TestValueOrDefaultURL(t *testing.T) {
